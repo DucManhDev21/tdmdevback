@@ -10,8 +10,10 @@ const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const jwt = require('jsonwebtoken');
 
-// 1. IMPORT FIREBASE ADMIN TIÊU CHUẨN (KHÔNG BỊ LỖI MISSING DEPENDENCY)
-const admin = require('firebase-admin');
+// 1. IMPORT TRỰC TIẾP FIREBASE ADMIN & FIRESTORE BÊN NGOÀI
+const { initializeApp, cert, getApps } = require('firebase-admin/app');
+const { getAuth } = require('firebase-admin/auth');
+const { Firestore, FieldValue } = require('@google-cloud/firestore');
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
@@ -30,7 +32,7 @@ const jwtSecret = process.env.JWT_SECRET || '';
 const tempMailApiToken = process.env.TEMPMAIL_API_TOKEN || '';
 const tempMailApiBaseUrl = (process.env.TEMPMAIL_API_BASE_URL || 'https://tempmail.id.vn/api').replace(/\/$/, '');
 
-// 2. KHỞI TẠO FIREBASE SAFE & CHỐNG LỖI PARSE ENVIRONMENT
+// 2. KHỞI TẠO FIREBASE & FIRESTORE SAFE
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
   console.error('[FATAL] Thiếu biến môi trường FIREBASE_SERVICE_ACCOUNT trên Railway!');
   process.exit(1);
@@ -40,19 +42,16 @@ let serviceAccount;
 try {
   let rawEnv = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
 
-  // Bỏ dấu ngoặc kép/đơn bao quanh nếu Railway truyền thừa
   if ((rawEnv.startsWith("'") && rawEnv.endsWith("'")) || (rawEnv.startsWith('"') && rawEnv.endsWith('"'))) {
     rawEnv = rawEnv.slice(1, -1).trim();
   }
 
-  // Tự động giải mã nếu truyền vào chuỗi Base64
   if (!rawEnv.startsWith('{') && /^[A-Za-z0-9+/=]+$/.test(rawEnv.replace(/\s/g, ''))) {
     rawEnv = Buffer.from(rawEnv, 'base64').toString('utf8');
   }
 
   serviceAccount = JSON.parse(rawEnv);
 
-  // Sửa lỗi ký tự xuống dòng của Private Key khi lưu trên ENV
   if (serviceAccount.private_key) {
     serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
   }
@@ -62,9 +61,9 @@ try {
 }
 
 try {
-  if (admin.apps.length === 0) {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
+  if (getApps().length === 0) {
+    initializeApp({
+      credential: cert(serviceAccount)
     });
   }
 } catch (error) {
@@ -72,8 +71,14 @@ try {
   process.exit(1);
 }
 
-const db = admin.firestore();
-const FieldValue = admin.firestore.FieldValue;
+// Khởi tạo Firestore bằng Google Cloud SDK với Service Account
+const db = new Firestore({
+  projectId: serviceAccount.project_id,
+  credentials: {
+    client_email: serviceAccount.client_email,
+    private_key: serviceAccount.private_key
+  }
+});
 // ---------------------------------------------
 
 if (!jwtSecret) console.warn('[WARN] JWT_SECRET is missing.');
@@ -339,7 +344,7 @@ app.get('/api/auth/verify', asyncRoute(async (req, res) => {
   if (!token) return res.status(401).json({ success: false, message: 'Thiếu Firebase ID token.' });
 
   try {
-    const decoded = await admin.auth().verifyIdToken(token);
+    const decoded = await getAuth().verifyIdToken(token);
     res.json({
       success: true,
       user: {
