@@ -10,10 +10,8 @@ const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const jwt = require('jsonwebtoken');
 
-// 1. IMPORT ĐÚNG CHUẨN FIREBASE ADMIN SDK v11+ / v12+
-const { initializeApp, cert, getApps } = require('firebase-admin/app');
-const { getFirestore, FieldValue } = require('firebase-admin/firestore');
-const { getAuth } = require('firebase-admin/auth');
+// 1. IMPORT FIREBASE ADMIN TIÊU CHUẨN (KHÔNG BỊ LỖI MISSING DEPENDENCY)
+const admin = require('firebase-admin');
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
@@ -47,26 +45,26 @@ try {
     rawEnv = rawEnv.slice(1, -1).trim();
   }
 
-  // Tự động giải mã nếu bạn truyền vào chuỗi Base64
+  // Tự động giải mã nếu truyền vào chuỗi Base64
   if (!rawEnv.startsWith('{') && /^[A-Za-z0-9+/=]+$/.test(rawEnv.replace(/\s/g, ''))) {
     rawEnv = Buffer.from(rawEnv, 'base64').toString('utf8');
   }
 
   serviceAccount = JSON.parse(rawEnv);
 
-  // Sửa lỗi kí tự xuống dòng của Private Key khi lưu trên ENV
+  // Sửa lỗi ký tự xuống dòng của Private Key khi lưu trên ENV
   if (serviceAccount.private_key) {
     serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
   }
 } catch (error) {
-  console.error('[FATAL] FIREBASE_SERVICE_ACCOUNT không phải JSON hợp lệ:', error.message);
+  console.error('[FATAL] FIREBASE_SERVICE_ACCOUNT không phải JSON/Base64 hợp lệ:', error.message);
   process.exit(1);
 }
 
 try {
-  if (getApps().length === 0) {
-    initializeApp({
-      credential: cert(serviceAccount)
+  if (admin.apps.length === 0) {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
     });
   }
 } catch (error) {
@@ -74,7 +72,8 @@ try {
   process.exit(1);
 }
 
-const db = getFirestore();
+const db = admin.firestore();
+const FieldValue = admin.firestore.FieldValue;
 // ---------------------------------------------
 
 if (!jwtSecret) console.warn('[WARN] JWT_SECRET is missing.');
@@ -334,14 +333,13 @@ app.get('/api/menu/stream', asyncRoute(async (req, res) => {
   });
 }));
 
-// 3. SỬ DỤNG GETAUTH() THAY CHO ADMIN.AUTH()
 app.get('/api/auth/verify', asyncRoute(async (req, res) => {
   const authorization = String(req.get('Authorization') || '');
   const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
   if (!token) return res.status(401).json({ success: false, message: 'Thiếu Firebase ID token.' });
 
   try {
-    const decoded = await getAuth().verifyIdToken(token);
+    const decoded = await admin.auth().verifyIdToken(token);
     res.json({
       success: true,
       user: {
