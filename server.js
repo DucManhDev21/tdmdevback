@@ -28,6 +28,7 @@ const jwtSecret = process.env.JWT_SECRET || '';
 const tempMailApiToken = process.env.TEMPMAIL_API_TOKEN || '';
 const tempMailApiBaseUrl = (process.env.TEMPMAIL_API_BASE_URL || 'https://tempmail.id.vn/api').replace(/\/$/, '');
 
+// --- SỬA LỖI KHỞI TẠO FIREBASE ADMIN ---
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
   console.error('[FATAL] FIREBASE_SERVICE_ACCOUNT is missing.');
   process.exit(1);
@@ -35,7 +36,24 @@ if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
 
 let serviceAccount;
 try {
-  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  let rawEnv = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+
+  // Bỏ dấu ngoặc kép/đơn bao quanh nếu Railway truyền dư
+  if ((rawEnv.startsWith("'") && rawEnv.endsWith("'")) || (rawEnv.startsWith('"') && rawEnv.endsWith('"'))) {
+    rawEnv = rawEnv.slice(1, -1).trim();
+  }
+
+  // Hỗ trợ decode nếu chuỗi truyền vào là Base64
+  if (!rawEnv.startsWith('{') && /^[A-Za-z0-9+/=]+$/.test(rawEnv.replace(/\s/g, ''))) {
+    rawEnv = Buffer.from(rawEnv, 'base64').toString('utf8');
+  }
+
+  serviceAccount = JSON.parse(rawEnv);
+
+  // Xử lý các dấu xuống dòng bị hỏng trong Private Key
+  if (serviceAccount.private_key) {
+    serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+  }
 } catch (error) {
   console.error('[FATAL] FIREBASE_SERVICE_ACCOUNT is not valid JSON:', error.message);
   process.exit(1);
@@ -49,6 +67,7 @@ try {
   console.error('[FATAL] Firebase Admin initialization failed:', error.message);
   process.exit(1);
 }
+// ------------------------------------
 
 const db = admin.firestore();
 const { FieldValue } = admin.firestore;
@@ -473,9 +492,6 @@ app.delete('/api/temp-mail/current', asyncRoute(async (req, res) => {
   const session = await getTempSession(req);
   if (!session?.mailId) return res.status(404).json({ success: false, message: 'Không có hộp thư hiện tại.' });
 
-  // The currently indexed TempMail API reference documents creation/list/read
-  // endpoints but does not document a mailbox-delete operation. We attempt
-  // the conventional DELETE endpoint and return a clear 501 when unsupported.
   const upstream = await callTempMail(`/email/${encodeURIComponent(session.mailId)}`, { method: 'DELETE' });
 
   if (upstream.status === 404 || upstream.status === 405 || upstream.status === 501) {
