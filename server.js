@@ -9,7 +9,11 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const jwt = require('jsonwebtoken');
-const admin = require('firebase-admin');
+
+// Import Firebase Admin theo chuẩn SDK v11+
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getFirestore, FieldValue } = require('firebase-admin/firestore');
+const { getAuth } = require('firebase-admin/auth');
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
@@ -28,7 +32,7 @@ const jwtSecret = process.env.JWT_SECRET || '';
 const tempMailApiToken = process.env.TEMPMAIL_API_TOKEN || '';
 const tempMailApiBaseUrl = (process.env.TEMPMAIL_API_BASE_URL || 'https://tempmail.id.vn/api').replace(/\/$/, '');
 
-// --- SỬA LỖI KHỞI TẠO FIREBASE ADMIN ---
+// --- XỬ LÝ & KHỞI TẠO FIREBASE ADMIN SAFE ---
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
   console.error('[FATAL] FIREBASE_SERVICE_ACCOUNT is missing.');
   process.exit(1);
@@ -43,14 +47,14 @@ try {
     rawEnv = rawEnv.slice(1, -1).trim();
   }
 
-  // Hỗ trợ decode nếu chuỗi truyền vào là Base64
+  // Tự động giải mã nếu người dùng truyền vào chuỗi Base64
   if (!rawEnv.startsWith('{') && /^[A-Za-z0-9+/=]+$/.test(rawEnv.replace(/\s/g, ''))) {
     rawEnv = Buffer.from(rawEnv, 'base64').toString('utf8');
   }
 
   serviceAccount = JSON.parse(rawEnv);
 
-  // Xử lý các dấu xuống dòng bị hỏng trong Private Key
+  // Sửa lỗi kí tự xuống dòng trong Private Key
   if (serviceAccount.private_key) {
     serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
   }
@@ -60,17 +64,16 @@ try {
 }
 
 try {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
+  initializeApp({
+    credential: cert(serviceAccount)
   });
 } catch (error) {
   console.error('[FATAL] Firebase Admin initialization failed:', error.message);
   process.exit(1);
 }
-// ------------------------------------
 
-const db = admin.firestore();
-const { FieldValue } = admin.firestore;
+const db = getFirestore();
+// ---------------------------------------------
 
 if (!jwtSecret) {
   console.warn('[WARN] JWT_SECRET is missing. Admin login will be disabled.');
@@ -352,7 +355,7 @@ app.get('/api/auth/verify', asyncRoute(async (req, res) => {
   if (!token) return res.status(401).json({ success: false, message: 'Thiếu Firebase ID token.' });
 
   try {
-    const decoded = await admin.auth().verifyIdToken(token);
+    const decoded = await getAuth().verifyIdToken(token);
     res.json({
       success: true,
       user: {
