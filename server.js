@@ -10,8 +10,8 @@ const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 const jwt = require('jsonwebtoken');
 
-// Import Firebase Admin theo chuẩn SDK v11+
-const { initializeApp, cert } = require('firebase-admin/app');
+// 1. IMPORT ĐÚNG CHUẨN FIREBASE ADMIN SDK v11+ / v12+
+const { initializeApp, cert, getApps } = require('firebase-admin/app');
 const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 const { getAuth } = require('firebase-admin/auth');
 
@@ -32,9 +32,9 @@ const jwtSecret = process.env.JWT_SECRET || '';
 const tempMailApiToken = process.env.TEMPMAIL_API_TOKEN || '';
 const tempMailApiBaseUrl = (process.env.TEMPMAIL_API_BASE_URL || 'https://tempmail.id.vn/api').replace(/\/$/, '');
 
-// --- XỬ LÝ & KHỞI TẠO FIREBASE ADMIN SAFE ---
+// 2. KHỞI TẠO FIREBASE SAFE & CHỐNG LỖI PARSE ENVIRONMENT
 if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
-  console.error('[FATAL] FIREBASE_SERVICE_ACCOUNT is missing.');
+  console.error('[FATAL] Thiếu biến môi trường FIREBASE_SERVICE_ACCOUNT trên Railway!');
   process.exit(1);
 }
 
@@ -42,48 +42,44 @@ let serviceAccount;
 try {
   let rawEnv = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
 
-  // Bỏ dấu ngoặc kép/đơn bao quanh nếu Railway truyền dư
+  // Bỏ dấu ngoặc kép/đơn bao quanh nếu Railway truyền thừa
   if ((rawEnv.startsWith("'") && rawEnv.endsWith("'")) || (rawEnv.startsWith('"') && rawEnv.endsWith('"'))) {
     rawEnv = rawEnv.slice(1, -1).trim();
   }
 
-  // Tự động giải mã nếu người dùng truyền vào chuỗi Base64
+  // Tự động giải mã nếu bạn truyền vào chuỗi Base64
   if (!rawEnv.startsWith('{') && /^[A-Za-z0-9+/=]+$/.test(rawEnv.replace(/\s/g, ''))) {
     rawEnv = Buffer.from(rawEnv, 'base64').toString('utf8');
   }
 
   serviceAccount = JSON.parse(rawEnv);
 
-  // Sửa lỗi kí tự xuống dòng trong Private Key
+  // Sửa lỗi kí tự xuống dòng của Private Key khi lưu trên ENV
   if (serviceAccount.private_key) {
     serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
   }
 } catch (error) {
-  console.error('[FATAL] FIREBASE_SERVICE_ACCOUNT is not valid JSON:', error.message);
+  console.error('[FATAL] FIREBASE_SERVICE_ACCOUNT không phải JSON hợp lệ:', error.message);
   process.exit(1);
 }
 
 try {
-  initializeApp({
-    credential: cert(serviceAccount)
-  });
+  if (getApps().length === 0) {
+    initializeApp({
+      credential: cert(serviceAccount)
+    });
+  }
 } catch (error) {
-  console.error('[FATAL] Firebase Admin initialization failed:', error.message);
+  console.error('[FATAL] Lỗi khởi tạo Firebase Admin:', error.message);
   process.exit(1);
 }
 
 const db = getFirestore();
 // ---------------------------------------------
 
-if (!jwtSecret) {
-  console.warn('[WARN] JWT_SECRET is missing. Admin login will be disabled.');
-}
-if (!adminPassword) {
-  console.warn('[WARN] ADMIN_PASSWORD is missing. Admin login will be disabled.');
-}
-if (!tempMailApiToken) {
-  console.warn('[WARN] TEMPMAIL_API_TOKEN is missing. Temp Mail routes will return configuration errors.');
-}
+if (!jwtSecret) console.warn('[WARN] JWT_SECRET is missing.');
+if (!adminPassword) console.warn('[WARN] ADMIN_PASSWORD is missing.');
+if (!tempMailApiToken) console.warn('[WARN] TEMPMAIL_API_TOKEN is missing.');
 
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
@@ -114,7 +110,7 @@ const adminLoginLimiter = rateLimit({
   limit: 10,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
-  message: { success: false, message: 'Quá nhiều lần thử đăng nhập quản trị. Vui lòng thử lại sau.' }
+  message: { success: false, message: 'Quá nhiều lần thử đăng nhập. Vui lòng thử lại sau.' }
 });
 
 app.use('/api', publicLimiter);
@@ -170,8 +166,7 @@ function cleanText(value) {
 function validateHttpUrl(value) {
   try {
     const url = new URL(value);
-    if (!['http:', 'https:'].includes(url.protocol)) return false;
-    return true;
+    return ['http:', 'https:'].includes(url.protocol);
   } catch {
     return false;
   }
@@ -221,26 +216,18 @@ function createAdminToken() {
 }
 
 function requireAdmin(req, res, next) {
-  if (!jwtSecret) {
-    return res.status(503).json({ success: false, message: 'JWT_SECRET chưa được cấu hình.' });
-  }
-
+  if (!jwtSecret) return res.status(503).json({ success: false, message: 'JWT_SECRET chưa được cấu hình.' });
   const authorization = String(req.get('Authorization') || '');
   const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
-  if (!token) {
-    return res.status(401).json({ success: false, message: 'Thiếu phiên quản trị.' });
-  }
+  if (!token) return res.status(401).json({ success: false, message: 'Thiếu phiên quản trị.' });
 
   try {
-    const payload = jwt.verify(token, jwtSecret, {
-      issuer: 'tdm-dev',
-      audience: 'tdm-dev-admin'
-    });
+    const payload = jwt.verify(token, jwtSecret, { issuer: 'tdm-dev', audience: 'tdm-dev-admin' });
     if (payload.role !== 'admin') throw new Error('Invalid role');
     req.admin = payload;
     next();
   } catch {
-    return res.status(401).json({ success: false, message: 'Phiên quản trị không hợp lệ hoặc đã hết hạn.' });
+    return res.status(401).json({ success: false, message: 'Phiên quản trị không hợp lệ hoặc hết hạn.' });
   }
 }
 
@@ -253,7 +240,7 @@ function parseMenuPayload(body) {
 
   if (!title) throw new Error('Tên mục menu không được để trống.');
   if (!validateHttpUrl(url)) throw new Error('URL phải là địa chỉ HTTP/HTTPS hợp lệ.');
-  if (!Number.isInteger(order) || order < 0 || order > 1000000) throw new Error('Order phải là số nguyên từ 0 trở lên.');
+  if (!Number.isInteger(order) || order < 0 || order > 1000000) throw new Error('Order không hợp lệ.');
 
   return { title, type, url, order, enabled };
 }
@@ -309,6 +296,8 @@ function startMenuWatcher() {
 
 startMenuWatcher();
 
+// --- ROUTES ---
+
 app.get('/health', asyncRoute(async (_req, res) => {
   res.json({
     success: true,
@@ -336,11 +325,7 @@ app.get('/api/menu/stream', asyncRoute(async (req, res) => {
   await sendMenuSnapshot(res, false);
 
   const heartbeat = setInterval(() => {
-    try {
-      res.write(': heartbeat\n\n');
-    } catch {
-      clearInterval(heartbeat);
-    }
+    try { res.write(': heartbeat\n\n'); } catch { clearInterval(heartbeat); }
   }, 20000);
 
   req.on('close', () => {
@@ -349,6 +334,7 @@ app.get('/api/menu/stream', asyncRoute(async (req, res) => {
   });
 }));
 
+// 3. SỬ DỤNG GETAUTH() THAY CHO ADMIN.AUTH()
 app.get('/api/auth/verify', asyncRoute(async (req, res) => {
   const authorization = String(req.get('Authorization') || '');
   const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
@@ -374,15 +360,13 @@ app.get('/api/auth/verify', asyncRoute(async (req, res) => {
 
 app.post('/api/admin/login', adminLoginLimiter, asyncRoute(async (req, res) => {
   if (!adminPassword || !jwtSecret) {
-    return res.status(503).json({ success: false, message: 'Admin login chưa được cấu hình trên backend.' });
+    return res.status(503).json({ success: false, message: 'Admin login chưa cấu hình.' });
   }
-
   const password = String(req.body?.password || '');
   if (!password || password !== adminPassword) {
-    return res.status(401).json({ success: false, message: 'Mật khẩu quản trị không chính xác.' });
+    return res.status(401).json({ success: false, message: 'Mật khẩu không chính xác.' });
   }
-
-  res.json({ success: true, accessToken: createAdminToken(), expiresIn: 8 * 60 * 60 });
+  res.json({ success: true, accessToken: createAdminToken(), expiresIn: 28800 });
 }));
 
 app.get('/api/admin/menus', requireAdmin, asyncRoute(async (_req, res) => {
@@ -402,11 +386,11 @@ app.post('/api/admin/menus', requireAdmin, asyncRoute(async (req, res) => {
 
 app.put('/api/admin/menus/:id', requireAdmin, asyncRoute(async (req, res) => {
   const id = cleanText(req.params.id);
-  if (!id || id.length > 128) return res.status(400).json({ success: false, message: 'ID menu không hợp lệ.' });
+  if (!id) return res.status(400).json({ success: false, message: 'ID không hợp lệ.' });
   const menu = parseMenuPayload(req.body);
   const ref = db.collection('menus').doc(id);
   const existing = await ref.get();
-  if (!existing.exists) return res.status(404).json({ success: false, message: 'Không tìm thấy mục menu.' });
+  if (!existing.exists) return res.status(404).json({ success: false, message: 'Không tìm thấy menu.' });
 
   await ref.update({ ...menu, updatedAt: FieldValue.serverTimestamp() });
   res.json({ success: true, menu: { id, ...menu } });
@@ -414,9 +398,9 @@ app.put('/api/admin/menus/:id', requireAdmin, asyncRoute(async (req, res) => {
 
 app.delete('/api/admin/menus/:id', requireAdmin, asyncRoute(async (req, res) => {
   const id = cleanText(req.params.id);
-  if (!id || id.length > 128) return res.status(400).json({ success: false, message: 'ID menu không hợp lệ.' });
+  if (!id) return res.status(400).json({ success: false, message: 'ID không hợp lệ.' });
   await db.collection('menus').doc(id).delete();
-  res.json({ success: true, message: 'Đã xóa mục menu.' });
+  res.json({ success: true, message: 'Đã xóa menu.' });
 }));
 
 app.get('/api/temp-mail/session', asyncRoute(async (req, res) => {
@@ -427,7 +411,6 @@ app.get('/api/temp-mail/session', asyncRoute(async (req, res) => {
 
 app.post('/api/temp-mail/create', asyncRoute(async (req, res) => {
   if (!requireTempMailConfig(res)) return;
-
   const sessionId = getOrCreateSessionId(req);
   const user = cleanText(req.body?.user).replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 64);
   const domain = cleanText(req.body?.domain).slice(0, 120);
@@ -436,13 +419,9 @@ app.post('/api/temp-mail/create', asyncRoute(async (req, res) => {
   if (user) payload.user = user;
   if (domain) payload.domain = domain;
 
-  const upstream = await callTempMail('/email/create', {
-    method: 'POST',
-    data: payload
-  });
-
+  const upstream = await callTempMail('/email/create', { method: 'POST', data: payload });
   if (upstream.status < 200 || upstream.status >= 300) {
-    return res.status(upstream.status).json({ success: false, message: safeMessage({ response: upstream }), upstream: upstream.data });
+    return res.status(upstream.status).json({ success: false, message: safeMessage({ response: upstream }) });
   }
 
   const data = extractTempMailData(upstream) || {};
@@ -452,7 +431,7 @@ app.post('/api/temp-mail/create', asyncRoute(async (req, res) => {
   };
 
   if (!mailbox.id || !mailbox.email) {
-    return res.status(502).json({ success: false, message: 'TempMail API trả về dữ liệu tạo mail không đúng định dạng.', upstream: upstream.data });
+    return res.status(502).json({ success: false, message: 'Dữ liệu TempMail trả về không hợp lệ.' });
   }
 
   await saveTempSession(sessionId, mailbox);
@@ -463,62 +442,56 @@ app.post('/api/temp-mail/create', asyncRoute(async (req, res) => {
 app.get('/api/temp-mail/messages', asyncRoute(async (req, res) => {
   if (!requireTempMailConfig(res)) return;
   const session = await getTempSession(req);
-  if (!session?.mailId) return res.status(404).json({ success: false, message: 'Chưa có hộp thư trong phiên hiện tại.' });
+  if (!session?.mailId) return res.status(404).json({ success: false, message: 'Chưa có hộp thư.' });
 
   const upstream = await callTempMail(`/email/${encodeURIComponent(session.mailId)}`, { method: 'GET' });
   if (upstream.status < 200 || upstream.status >= 300) {
-    return res.status(upstream.status).json({ success: false, message: safeMessage({ response: upstream }), upstream: upstream.data });
+    return res.status(upstream.status).json({ success: false, message: safeMessage({ response: upstream }) });
   }
 
-  res.json({ success: true, mailbox: session, data: extractTempMailData(upstream), upstream: upstream.data });
+  res.json({ success: true, mailbox: session, data: extractTempMailData(upstream) });
 }));
 
 app.get('/api/temp-mail/message/:messageId', asyncRoute(async (req, res) => {
   if (!requireTempMailConfig(res)) return;
   const session = await getTempSession(req);
-  if (!session?.mailId) return res.status(404).json({ success: false, message: 'Chưa có hộp thư trong phiên hiện tại.' });
+  if (!session?.mailId) return res.status(404).json({ success: false, message: 'Chưa có hộp thư.' });
 
   const messageId = cleanText(req.params.messageId);
-  if (!messageId || messageId.length > 256) return res.status(400).json({ success: false, message: 'Message ID không hợp lệ.' });
-
   const upstream = await callTempMail(`/message/${encodeURIComponent(messageId)}`, { method: 'GET' });
   if (upstream.status < 200 || upstream.status >= 300) {
-    return res.status(upstream.status).json({ success: false, message: safeMessage({ response: upstream }), upstream: upstream.data });
+    return res.status(upstream.status).json({ success: false, message: safeMessage({ response: upstream }) });
   }
 
-  res.json({ success: true, data: extractTempMailData(upstream), upstream: upstream.data });
+  res.json({ success: true, data: extractTempMailData(upstream) });
 }));
 
 app.delete('/api/temp-mail/current', asyncRoute(async (req, res) => {
   if (!requireTempMailConfig(res)) return;
   const sessionId = String(req.get('X-Temp-Session') || '').trim();
   const session = await getTempSession(req);
-  if (!session?.mailId) return res.status(404).json({ success: false, message: 'Không có hộp thư hiện tại.' });
+  if (!session?.mailId) return res.status(404).json({ success: false, message: 'Không có hộp thư.' });
 
   const upstream = await callTempMail(`/email/${encodeURIComponent(session.mailId)}`, { method: 'DELETE' });
 
-  if (upstream.status === 404 || upstream.status === 405 || upstream.status === 501) {
+  if ([404, 405, 501].includes(upstream.status)) {
     await clearTempSession(sessionId);
-    return res.status(501).json({
-      success: false,
-      unsupported: true,
-      message: 'API TempMail hiện tại không công bố endpoint xóa hộp thư. Phiên cục bộ đã được xóa; hộp thư sẽ hết hạn theo chính sách của TempMail.'
-    });
+    return res.status(501).json({ success: false, message: 'Endpoint xóa hộp thư không hỗ trợ.' });
   }
 
   if (upstream.status < 200 || upstream.status >= 300) {
-    return res.status(upstream.status).json({ success: false, message: safeMessage({ response: upstream }), upstream: upstream.data });
+    return res.status(upstream.status).json({ success: false, message: safeMessage({ response: upstream }) });
   }
 
   await clearTempSession(sessionId);
-  res.json({ success: true, message: 'Đã xóa hộp thư khỏi phiên hiện tại.', upstream: upstream.data });
+  res.json({ success: true, message: 'Đã xóa hộp thư.' });
 }));
 
 app.post('/api/link4m/shorten', asyncRoute(async (req, res) => {
   const apiKey = cleanText(req.body?.apiKey).slice(0, 1000);
   const url = cleanText(req.body?.url).slice(0, 4000);
-  if (!apiKey) return res.status(400).json({ success: false, message: 'API Key Link4M không được để trống.' });
-  if (!validateHttpUrl(url)) return res.status(400).json({ success: false, message: 'URL đích phải là HTTP/HTTPS hợp lệ.' });
+  if (!apiKey) return res.status(400).json({ success: false, message: 'API Key không được trống.' });
+  if (!validateHttpUrl(url)) return res.status(400).json({ success: false, message: 'URL không hợp lệ.' });
 
   const upstream = await axios.get('https://link4m.co/api-shorten/v2', {
     params: { api: apiKey, url },
@@ -527,51 +500,27 @@ app.post('/api/link4m/shorten', asyncRoute(async (req, res) => {
   });
 
   if (upstream.status < 200 || upstream.status >= 300) {
-    return res.status(upstream.status).json({ success: false, message: safeMessage({ response: upstream }), upstream: upstream.data });
+    return res.status(upstream.status).json({ success: false, message: safeMessage({ response: upstream }) });
   }
 
   const body = upstream.data;
-  const candidate = body?.shortenedUrl
-    || body?.shorturl
-    || body?.shortUrl
-    || body?.short
-    || body?.link
-    || body?.url
-    || body?.data?.shortenedUrl
-    || body?.data?.shorturl
-    || body?.data?.shortUrl
-    || body?.data?.short
-    || body?.data?.link
-    || body?.result?.shortenedUrl
-    || body?.result?.shorturl
-    || body?.result?.shortUrl;
+  const candidate = body?.shortenedUrl || body?.shorturl || body?.shortUrl || body?.link || body?.url;
+  if (!candidate) return res.status(502).json({ success: false, message: 'Link4M trả về sai cấu trúc.' });
 
-  if (!candidate) {
-    return res.status(502).json({ success: false, message: 'Link4M không trả về URL rút gọn theo định dạng dự kiến.', upstream: body });
-  }
-
-  res.json({ success: true, shortUrl: candidate, upstream: body });
+  res.json({ success: true, shortUrl: candidate });
 }));
 
 app.use((error, _req, res, _next) => {
   if (error?.message === 'CORS origin not allowed.') {
-    return res.status(403).json({ success: false, message: 'Origin không được phép.' });
+    return res.status(403).json({ success: false, message: 'Origin bị cấm.' });
   }
   console.error('[ERROR]', error);
   res.status(error?.status || 500).json({ success: false, message: NODE_ENV === 'production' ? 'Lỗi máy chủ.' : error.message });
 });
 
 const server = app.listen(PORT, () => {
-  console.log(`[TDM Dev] Backend listening on port ${PORT}`);
-  console.log(`[TDM Dev] Firebase project: ${serviceAccount.project_id || 'unknown'}`);
+  console.log(`[TDM Dev] Running on port ${PORT}`);
 });
 
-process.on('SIGTERM', () => {
-  if (menuUnsubscribe) menuUnsubscribe();
-  server.close(() => process.exit(0));
-});
-
-process.on('SIGINT', () => {
-  if (menuUnsubscribe) menuUnsubscribe();
-  server.close(() => process.exit(0));
-});
+process.on('SIGTERM', () => { if (menuUnsubscribe) menuUnsubscribe(); server.close(() => process.exit(0)); });
+process.on('SIGINT', () => { if (menuUnsubscribe) menuUnsubscribe(); server.close(() => process.exit(0)); });
