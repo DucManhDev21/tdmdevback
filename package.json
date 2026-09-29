@@ -1,21 +1,22 @@
 {
-  "name": "tdm-dev-backend",
+  "name": "tdmdev-backend",
   "version": "1.0.0",
-  "private": true,
-  "description": "TDM Dev backend - Temp Mail + Link4M + Firestore dynamic menu API",
+  "description": "TDM Dev backend for Link4M, temporary mail, bulk email and admin configuration.",
+  "type": "commonjs",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=20"
   },
   "dependencies": {
-    "axios": "^1.11.0",
+    "axios": "^1.12.2",
     "cors": "^2.8.5",
-    "dotenv": "^17.2.1",
+    "dotenv": "^17.2.2",
     "express": "^5.1.0",
-    "firebase-admin": "^13.4.0"
+    "multer": "^2.0.2",
+    "nodemailer": "^7.0.6"
   }
 }
