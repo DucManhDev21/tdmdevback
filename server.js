@@ -234,6 +234,22 @@ app.post('/api/link4m/shorten', async (req, res) => {
   }
 });
 
+const mailTmSessions = new Map();
+const MAIL_TM_BASE_URL = 'https://api.mail.tm';
+
+async function mailTmRequest(config) {
+  const response = await axios({
+    ...config,
+    baseURL: MAIL_TM_BASE_URL,
+    timeout: 20_000,
+    headers: {
+      Accept: 'application/json',
+      ...(config.headers || {}),
+    },
+  });
+  return response.data;
+}
+
 app.post('/api/tempmail/create', async (req, res) => {
   if (adminConfig.tools.tempmail === false) {
     return jsonError(res, 503, 'Công cụ TempMail đang tạm tắt.', 'TOOL_DISABLED');
@@ -243,23 +259,42 @@ app.post('/api/tempmail/create', async (req, res) => {
   }
 
   try {
-    const data = await secMailRequest({
+    const domainsPayload = await mailTmRequest({ method: 'GET', url: '/domains' });
+    const domains = Array.isArray(domainsPayload?.['hydra:member'])
+      ? domainsPayload['hydra:member']
+      : Array.isArray(domainsPayload?.domains)
+        ? domainsPayload.domains
+        : Array.isArray(domainsPayload)
+          ? domainsPayload
+          : [];
+    const activeDomain = domains.find((item) => item?.isActive !== false && item?.isPrivate !== true && item?.domain);
+    if (!activeDomain) throw new Error('Mail.tm hiện không cung cấp domain khả dụng.');
+
+    const localPart = `tdm${crypto.randomBytes(7).toString('hex')}`;
+    const email = `${localPart}@${activeDomain.domain}`.toLowerCase();
+    const password = `${crypto.randomBytes(24).toString('base64url')}A9!`;
+
+    await mailTmRequest({
       method: 'POST',
-      url: `/api/emails/${encodeURIComponent(process.env.TEMPMAIL_API_TOKEN)}`,
+      url: '/accounts',
+      headers: { 'Content-Type': 'application/json' },
+      data: { address: email, password },
     });
 
-    const email = data?.data?.email || data?.email;
-    if (!email) throw new Error(data?.message || '1SecMail không trả về email.');
-
-    tempMailSessions.set(email.toLowerCase(), {
-      email,
-      createdAt: nowIso(),
+    const tokenPayload = await mailTmRequest({
+      method: 'POST',
+      url: '/token',
+      headers: { 'Content-Type': 'application/json' },
+      data: { address: email, password },
     });
+    const token = tokenPayload?.token;
+    if (!token) throw new Error('Mail.tm không trả về token xác thực.');
 
+    mailTmSessions.set(email, { email, token, createdAt: nowIso() });
     return res.json({ success: true, email });
   } catch (error) {
-    const message = error.response?.data?.message || error.response?.data?.error || error.message;
-    return jsonError(res, 502, `Không thể tạo email tạm thời: ${message}`, 'TEMPMAIL_PROVIDER_ERROR');
+    const message = error.response?.data?.['hydra:description'] || error.response?.data?.message || error.message;
+    return jsonError(res, 502, `Không thể tạo email tạm thời qua Mail.tm: ${message}`, 'TEMPMAIL_PROVIDER_ERROR');
   }
 });
 
@@ -271,45 +306,59 @@ app.get('/api/tempmail/messages', async (req, res) => {
     return jsonError(res, 429, 'Bạn đang refresh hộp thư quá nhanh.', 'RATE_LIMITED');
   }
 
-  try {
-    const { login, domain } = splitEmail(email);
-    const listData = await secMailRequest({
-      method: 'GET',
-      url: `/api/messages/${encodeURIComponent(process.env.TEMPMAIL_API_TOKEN)}/${encodeURIComponent(email)}`,
-    });
+  const mailbox = mailTmSessions.get(email);
+  if (!mailbox?.token) {
+    return jsonError(res, 404, 'Không tìm thấy phiên hộp thư này. Hãy tạo email mới trên thiết bị hiện tại.', 'MAILBOX_NOT_FOUND');
+  }
 
-    const messageList = Array.isArray(listData?.messages)
-      ? listData.messages
-      : Array.isArray(listData?.data?.messages)
-        ? listData.data.messages
-        : Array.isArray(listData)
-          ? listData
-          : [];
+  try {
+    const authHeaders = { Authorization: `Bearer ${mailbox.token}` };
+    const listPayload = await mailTmRequest({ method: 'GET', url: '/messages', headers: authHeaders });
+    const messageList = Array.isArray(listPayload?.['hydra:member'])
+      ? listPayload['hydra:member']
+      : Array.isArray(listPayload?.messages)
+        ? listPayload.messages
+        : [];
 
     const messages = await Promise.all(messageList.slice(0, 30).map(async (message) => {
       if (!message?.id) return message;
       try {
-        const detail = await secMailRequest({
+        const detail = await mailTmRequest({
           method: 'GET',
-          url: `/api/messages/${encodeURIComponent(process.env.TEMPMAIL_API_TOKEN)}/message/${encodeURIComponent(message.id)}`,
+          url: `/messages/${encodeURIComponent(message.id)}`,
+          headers: authHeaders,
         });
-        return detail?.message || detail?.data?.message || message;
+        const from = detail?.from || message?.from || {};
+        const to = Array.isArray(detail?.to) ? detail.to.map((item) => item?.address).filter(Boolean).join(', ') : '';
+        return {
+          id: detail?.id || message.id,
+          subject: detail?.subject || message?.subject || '(Không có tiêu đề)',
+          from_email: from?.address || '',
+          from_name: from?.name || '',
+          to,
+          receivedAt: detail?.createdAt || message?.createdAt || null,
+          intro: detail?.intro || message?.intro || '',
+          textBody: detail?.text || '',
+          htmlBody: Array.isArray(detail?.html) ? detail.html.join('\n') : (detail?.html || ''),
+          content: detail?.text || detail?.intro || '',
+        };
       } catch {
-        return message;
+        return {
+          id: message.id,
+          subject: message.subject || '(Không có tiêu đề)',
+          from_email: message?.from?.address || '',
+          from_name: message?.from?.name || '',
+          receivedAt: message.createdAt || null,
+          intro: message.intro || '',
+          content: message.intro || '',
+        };
       }
     }));
 
-    return res.json({
-      success: true,
-      email,
-      login,
-      domain,
-      messages,
-      checkedAt: nowIso(),
-    });
+    return res.json({ success: true, email, messages, checkedAt: nowIso() });
   } catch (error) {
-    const message = error.response?.data?.message || error.response?.data?.error || error.message;
-    return jsonError(res, 502, `Không thể lấy hộp thư: ${message}`, 'TEMPMAIL_PROVIDER_ERROR');
+    const message = error.response?.data?.['hydra:description'] || error.response?.data?.message || error.message;
+    return jsonError(res, 502, `Không thể lấy hộp thư Mail.tm: ${message}`, 'TEMPMAIL_PROVIDER_ERROR');
   }
 });
 
