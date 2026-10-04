@@ -5,6 +5,7 @@ const nodemailer = require('nodemailer');
 const multer = require('multer');
 const axios = require('axios');
 const crypto = require('crypto');
+const net = require('net');
 
 const envResult = dotenv.config();
 if (envResult.error && envResult.error.code !== 'ENOENT') {
@@ -12,6 +13,8 @@ if (envResult.error && envResult.error.code !== 'ENOENT') {
 }
 
 const app = express();
+// Railway chạy sau reverse proxy: cần thiết để req.ip là IP người dùng thật (rate limit theo từng người, không dùng chung).
+app.set('trust proxy', 1);
 const port = Number.parseInt(process.env.PORT || '5000', 10);
 
 const allowedOrigins = String(process.env.CORS_ORIGINS || '*')
@@ -27,7 +30,7 @@ app.use(cors({
     return callback(new Error('CORS origin not allowed'));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Accept', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Accept', 'Authorization', 'X-Mailbox-Token'],
   maxAge: 86400,
 }));
 
@@ -190,7 +193,16 @@ app.post('/api/link4m/shorten', async (req, res) => {
 });
 
 const mailTmSessions = new Map();
-const MAIL_TM_BASE_URL = 'https://api.mail.tm';
+const MAIL_TM_BASE_URL = process.env.MAIL_TM_BASE_URL || 'https://api.mail.tm';
+const MAIL_TM_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const MAIL_TM_DETAIL_LIMIT = 10; // mail.tm giới hạn ~8 request/giây/IP, nên chỉ lấy chi tiết cho thư mới nhất.
+
+function pruneMailTmSessions() {
+  const cutoff = Date.now() - MAIL_TM_SESSION_TTL_MS;
+  for (const [key, session] of mailTmSessions) {
+    if (session.createdMs < cutoff) mailTmSessions.delete(key);
+  }
+}
 
 async function mailTmRequest(config) {
   const response = await axios({
@@ -203,6 +215,11 @@ async function mailTmRequest(config) {
     },
   });
   return response.data;
+}
+
+function mailTmErrorMessage(error) {
+  const data = error.response?.data;
+  return data?.['hydra:description'] || data?.message || data?.detail || error.message;
 }
 
 app.post('/api/tempmail/create', async (req, res) => {
@@ -247,13 +264,14 @@ app.post('/api/tempmail/create', async (req, res) => {
     const token = tokenPayload?.token;
     if (!token) throw new Error('Mail.tm không trả về Bearer Token.');
 
-    mailTmSessions.set(email, { email, token, createdAt: nowIso() });
+    pruneMailTmSessions();
+    mailTmSessions.set(email, { email, token, createdMs: Date.now() });
     console.log(`[TempMail] Mailbox created: ${email} (domain=${activeDomain.domain})`);
-    return res.json({ success: true, email, provider: 'mail.tm' });
+    // Trả token về cho trình duyệt giữ: backend restart/redeploy trên Railway sẽ không làm mất hộp thư nữa.
+    return res.json({ success: true, email, token, provider: 'mail.tm' });
   } catch (error) {
-    const providerData = error.response?.data;
-    const message = providerData?.['hydra:description'] || providerData?.message || error.message;
-    console.error('[TempMail] Mail.tm create failed:', error.response?.status || '', message);
+    const message = mailTmErrorMessage(error);
+    console.error('[TempMail] Mail.tm create failed:', error.response?.status || error.code || '', message);
     return jsonError(res, 502, `Không thể tạo email tạm thời qua Mail.tm: ${message}`, 'TEMPMAIL_PROVIDER_ERROR', {
       providerStatus: error.response?.status || null,
     });
@@ -268,13 +286,14 @@ app.get('/api/tempmail/messages', async (req, res) => {
     return jsonError(res, 429, 'Bạn đang refresh hộp thư quá nhanh.', 'RATE_LIMITED');
   }
 
-  const mailbox = mailTmSessions.get(email);
-  if (!mailbox?.token) {
-    return jsonError(res, 404, 'Không tìm thấy phiên hộp thư này. Hãy tạo email mới trên thiết bị hiện tại.', 'MAILBOX_NOT_FOUND');
+  // Ưu tiên token do trình duyệt gửi lên; fallback sang phiên lưu trong RAM (tương thích bản cũ).
+  const token = String(req.get('x-mailbox-token') || '').trim() || mailTmSessions.get(email)?.token;
+  if (!token) {
+    return jsonError(res, 404, 'Không tìm thấy phiên hộp thư này. Hãy tạo email mới.', 'MAILBOX_NOT_FOUND');
   }
 
   try {
-    const authHeaders = { Authorization: `Bearer ${mailbox.token}` };
+    const authHeaders = { Authorization: `Bearer ${token}` };
     const listPayload = await mailTmRequest({ method: 'GET', url: '/messages', headers: authHeaders });
     const messageList = Array.isArray(listPayload?.['hydra:member'])
       ? listPayload['hydra:member']
@@ -282,8 +301,20 @@ app.get('/api/tempmail/messages', async (req, res) => {
         ? listPayload.messages
         : [];
 
-    const messages = await Promise.all(messageList.slice(0, 30).map(async (message) => {
-      if (!message?.id) return message;
+    const toText = (item) => (Array.isArray(item?.to) ? item.to.map((x) => x?.address).filter(Boolean).join(', ') : '');
+
+    const messages = await Promise.all(messageList.slice(0, 30).map(async (message, index) => {
+      const summary = {
+        id: message?.id,
+        subject: message?.subject || '(Không có tiêu đề)',
+        from_email: message?.from?.address || '',
+        from_name: message?.from?.name || '',
+        to: toText(message),
+        receivedAt: message?.createdAt || null,
+        intro: message?.intro || '',
+        content: message?.intro || '',
+      };
+      if (!message?.id || index >= MAIL_TM_DETAIL_LIMIT) return summary;
       try {
         const detail = await mailTmRequest({
           method: 'GET',
@@ -291,29 +322,20 @@ app.get('/api/tempmail/messages', async (req, res) => {
           headers: authHeaders,
         });
         const from = detail?.from || message?.from || {};
-        const to = Array.isArray(detail?.to) ? detail.to.map((item) => item?.address).filter(Boolean).join(', ') : '';
         return {
           id: detail?.id || message.id,
-          subject: detail?.subject || message?.subject || '(Không có tiêu đề)',
+          subject: detail?.subject || summary.subject,
           from_email: from?.address || '',
           from_name: from?.name || '',
-          to,
-          receivedAt: detail?.createdAt || message?.createdAt || null,
-          intro: detail?.intro || message?.intro || '',
+          to: toText(detail) || summary.to,
+          receivedAt: detail?.createdAt || summary.receivedAt,
+          intro: detail?.intro || summary.intro,
           textBody: detail?.text || '',
           htmlBody: Array.isArray(detail?.html) ? detail.html.join('\n') : (detail?.html || ''),
           content: detail?.text || detail?.intro || '',
         };
       } catch {
-        return {
-          id: message.id,
-          subject: message.subject || '(Không có tiêu đề)',
-          from_email: message?.from?.address || '',
-          from_name: message?.from?.name || '',
-          receivedAt: message.createdAt || null,
-          intro: message.intro || '',
-          content: message.intro || '',
-        };
+        return summary;
       }
     }));
 
@@ -327,17 +349,84 @@ app.get('/api/tempmail/messages', async (req, res) => {
       checkedAt: nowIso(),
     });
   } catch (error) {
-    const providerData = error.response?.data;
-    const message = providerData?.['hydra:description'] || providerData?.message || error.message;
-    console.error('[TempMail] Mail.tm inbox failed:', email, error.response?.status || '', message);
-    return jsonError(res, error.response?.status === 401 ? 404 : 502,
-      error.response?.status === 401
-        ? 'Phiên Mail.tm đã hết hạn. Hãy tạo email mới.'
-        : `Không thể lấy hộp thư Mail.tm: ${message}`,
-      error.response?.status === 401 ? 'MAILBOX_NOT_FOUND' : 'TEMPMAIL_PROVIDER_ERROR',
-      { providerStatus: error.response?.status || null });
+    const status = error.response?.status;
+    const message = mailTmErrorMessage(error);
+    console.error('[TempMail] Mail.tm inbox failed:', email, status || error.code || '', message);
+    if (status === 401) {
+      return jsonError(res, 404, 'Phiên Mail.tm đã hết hạn. Hãy tạo email mới.', 'MAILBOX_NOT_FOUND', { providerStatus: status });
+    }
+    if (status === 429) {
+      return jsonError(res, 429, 'Mail.tm đang giới hạn tốc độ. Đợi vài giây rồi thử lại.', 'RATE_LIMITED', { providerStatus: status });
+    }
+    return jsonError(res, 502, `Không thể lấy hộp thư Mail.tm: ${message}`, 'TEMPMAIL_PROVIDER_ERROR', { providerStatus: status || null });
   }
 });
+
+// ---------------------------------------------------------------------------
+// SendMail
+// Railway gói Free/Trial/Hobby CHẶN SMTP (cổng 25/465/587) -> nodemailer báo "Connection timeout".
+// Vì vậy mặc định gửi qua HTTPS API (Brevo hoặc Resend). SMTP chỉ dùng được trên gói Pro.
+// ---------------------------------------------------------------------------
+const BREVO_API_URL = process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email';
+const RESEND_API_URL = process.env.RESEND_API_URL || 'https://api.resend.com/emails';
+
+function getMailProvider() {
+  const forced = String(process.env.MAIL_PROVIDER || '').trim().toLowerCase();
+  if (forced) return forced;
+  if (process.env.BREVO_API_KEY) return 'brevo';
+  if (process.env.RESEND_API_KEY) return 'resend';
+  return 'smtp';
+}
+
+function getSender() {
+  const email = String(process.env.MAIL_FROM || process.env.GMAIL_USER || '').trim();
+  const name = String(process.env.MAIL_FROM_NAME || 'TDM Dev').trim();
+  return { email, name };
+}
+
+async function sendViaBrevo({ to, subject, body, isHtml, file }) {
+  const apiKey = String(process.env.BREVO_API_KEY || '').trim();
+  const sender = getSender();
+  if (!apiKey) throw new Error('Chưa cấu hình BREVO_API_KEY trên Railway.');
+  if (!sender.email) throw new Error('Chưa cấu hình MAIL_FROM (email người gửi đã xác minh trong Brevo).');
+
+  const payload = {
+    sender: { name: sender.name, email: sender.email },
+    to: [{ email: to }],
+    subject,
+    ...(isHtml ? { htmlContent: body } : { textContent: body }),
+    ...(file ? { attachment: [{ name: file.originalname, content: file.buffer.toString('base64') }] } : {}),
+  };
+  const response = await axios.post(BREVO_API_URL, payload, {
+    headers: { 'api-key': apiKey, accept: 'application/json', 'content-type': 'application/json' },
+    timeout: 30_000,
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+  });
+  return { messageId: response.data?.messageId || '', accepted: [to], rejected: [] };
+}
+
+async function sendViaResend({ to, subject, body, isHtml, file }) {
+  const apiKey = String(process.env.RESEND_API_KEY || '').trim();
+  const sender = getSender();
+  if (!apiKey) throw new Error('Chưa cấu hình RESEND_API_KEY trên Railway.');
+  if (!sender.email) throw new Error('Chưa cấu hình MAIL_FROM (địa chỉ thuộc domain đã verify trên Resend).');
+
+  const payload = {
+    from: `${sender.name} <${sender.email}>`,
+    to: [to],
+    subject,
+    ...(isHtml ? { html: body } : { text: body }),
+    ...(file ? { attachments: [{ filename: file.originalname, content: file.buffer.toString('base64') }] } : {}),
+  };
+  const response = await axios.post(RESEND_API_URL, payload, {
+    headers: { Authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
+    timeout: 30_000,
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+  });
+  return { messageId: response.data?.id || '', accepted: [to], rejected: [] };
+}
 
 function buildTransporter(userGmail, userAppPass) {
   const gmailUser = String(userGmail || process.env.GMAIL_USER || '').trim();
@@ -350,11 +439,33 @@ function buildTransporter(userGmail, userAppPass) {
     transporter: nodemailer.createTransport({
       service: 'gmail',
       auth: { user: gmailUser, pass: appPass },
-      connectionTimeout: 20_000,
-      greetingTimeout: 20_000,
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
       socketTimeout: 30_000,
     }),
   };
+}
+
+async function sendViaSmtp({ to, subject, body, isHtml, file, userGmail, userAppPass }) {
+  const { user, transporter } = buildTransporter(userGmail, userAppPass);
+  const info = await transporter.sendMail({
+    from: user,
+    to,
+    subject,
+    ...(isHtml ? { html: body } : { text: body }),
+    ...(file ? { attachments: [{ filename: file.originalname, content: file.buffer, contentType: file.mimetype }] } : {}),
+  });
+  return { messageId: info.messageId, accepted: info.accepted, rejected: info.rejected };
+}
+
+function describeMailError(error) {
+  const data = error.response?.data;
+  if (data) return data.message || data.error || data.detail || JSON.stringify(data).slice(0, 300);
+  const networkCodes = ['ETIMEDOUT', 'ECONNECTION', 'ESOCKET', 'ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH'];
+  if (networkCodes.includes(error.code) || /timeout/i.test(error.message || '')) {
+    return `${error.message}. Railway gói Free/Trial/Hobby chặn cổng SMTP; hãy đặt BREVO_API_KEY (hoặc RESEND_API_KEY) để gửi qua HTTPS.`;
+  }
+  return error.message;
 }
 
 app.post('/api/sendmail', upload.single('attachment'), async (req, res) => {
@@ -374,38 +485,69 @@ app.post('/api/sendmail', upload.single('attachment'), async (req, res) => {
   if (!subject) return jsonError(res, 400, 'Tiêu đề không được để trống.', 'VALIDATION_ERROR');
   if (!body.trim()) return jsonError(res, 400, 'Nội dung không được để trống.', 'VALIDATION_ERROR');
 
+  const provider = getMailProvider();
+  const message = { to: toEmail, subject, body, isHtml, file: req.file, userGmail, userAppPass };
+
   try {
-    const { user, transporter } = buildTransporter(userGmail, userAppPass);
-    const mailOptions = {
-      from: user,
-      to: toEmail,
-      subject,
-      ...(isHtml ? { html: body } : { text: body }),
-      ...(req.file ? {
-        attachments: [{
-          filename: req.file.originalname,
-          content: req.file.buffer,
-          contentType: req.file.mimetype,
-        }],
-      } : {}),
-    };
+    let result;
+    if (provider === 'brevo') result = await sendViaBrevo(message);
+    else if (provider === 'resend') result = await sendViaResend(message);
+    else if (provider === 'smtp') result = await sendViaSmtp(message);
+    else throw new Error(`MAIL_PROVIDER không hợp lệ: "${provider}" (dùng brevo, resend hoặc smtp).`);
 
-    const info = await transporter.sendMail(mailOptions);
+    // Trước đây server luôn giữ response 15 giây. Giờ mặc định 0; đặt SEND_DELAY_MS=15000 nếu muốn giữ hành vi cũ.
+    const delayMs = Number.parseInt(process.env.SEND_DELAY_MS || '0', 10) || 0;
+    if (delayMs > 0) await sleep(Math.min(delayMs, 60_000));
 
-    // Server delay intentionally mirrors the frontend requirement.
-    // The response is held for 15 seconds after the SMTP provider accepts the message.
-    await sleep(15_000);
-
-    return res.json({
-      success: true,
-      message: 'Gửi thành công',
-      messageId: info.messageId,
-      accepted: info.accepted,
-      rejected: info.rejected,
-    });
+    console.log(`[SendMail] Sent via ${provider} -> ${toEmail} (id=${result.messageId || 'n/a'})`);
+    return res.json({ success: true, message: 'Gửi thành công', provider, ...result });
   } catch (error) {
-    return jsonError(res, 502, `Gửi email thất bại: ${error.message}`, 'SMTP_ERROR');
+    console.error(`[SendMail] Failed via ${provider}:`, error.response?.status || error.code || '', describeMailError(error));
+    return jsonError(res, 502, `Gửi email thất bại (${provider}): ${describeMailError(error)}`, 'MAIL_SEND_ERROR');
   }
+});
+
+function tcpCheck(host, port, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const socket = net.createConnection({ host, port });
+    const done = (result) => { socket.destroy(); resolve({ host, port, ...result, ms: Date.now() - started }); };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => done({ ok: true }));
+    socket.once('timeout', () => done({ ok: false, error: 'timeout' }));
+    socket.once('error', (err) => done({ ok: false, error: err.code || err.message }));
+  });
+}
+
+// Chẩn đoán nhanh trên Railway: GET /api/admin/diagnostics?token=ADMIN_TOKEN
+app.get('/api/admin/diagnostics', requireAdmin, async (_req, res) => {
+  const startedAt = Date.now();
+  let mailTm;
+  try {
+    const response = await axios.get(`${MAIL_TM_BASE_URL}/domains`, { timeout: 10_000 });
+    mailTm = { ok: true, status: response.status, ms: Date.now() - startedAt };
+  } catch (error) {
+    mailTm = { ok: false, status: error.response?.status || null, error: error.code || error.message, ms: Date.now() - startedAt };
+  }
+  const smtp587 = await tcpCheck('smtp.gmail.com', 587);
+  const provider = getMailProvider();
+  res.json({
+    success: true,
+    node: process.version,
+    mailProvider: provider,
+    config: {
+      BREVO_API_KEY: Boolean(process.env.BREVO_API_KEY),
+      RESEND_API_KEY: Boolean(process.env.RESEND_API_KEY),
+      MAIL_FROM: Boolean(process.env.MAIL_FROM),
+      GMAIL_USER: Boolean(process.env.GMAIL_USER),
+      GMAIL_APP_PASS: Boolean(process.env.GMAIL_APP_PASS),
+      CORS_ORIGINS: allowedOrigins,
+    },
+    checks: { mailTm, smtpGmail587: smtp587 },
+    hint: provider === 'smtp' && !smtp587.ok
+      ? 'Cổng SMTP bị chặn (Railway Free/Trial/Hobby). Hãy đặt BREVO_API_KEY + MAIL_FROM.'
+      : undefined,
+  });
 });
 
 app.post('/api/admin/login', (req, res) => {
@@ -450,4 +592,5 @@ app.use((_req, res) => {
 app.listen(port, () => {
   console.log(`TDM Dev backend listening on port ${port}`);
   console.log(`Health: http://localhost:${port}/health`);
+  console.log(`[SendMail] provider=${getMailProvider()}`);
 });
